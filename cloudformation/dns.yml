@@ -1,0 +1,18 @@
+Description: Create DNS entries for frontend and backend endpoints
+
+Parameters:
+  FrontendDomain:
+    Description: | 
+      Domain name for the frontend (where the client HTML, JS and CSS comes from).
+  BackendDomain:
+    Description: Domain name for the backend server
+    Default: transcribro.com
+
+Resources:
+  FrontendDnsRecord:
+    Type: AWS::Route53::RecordSetGroup
+    Properties:
+      HostedZoneName: !Sub '${FrontendDomain}.'
+    RecordSets:
+      - Name: !Ref FrontendDomain
+        
