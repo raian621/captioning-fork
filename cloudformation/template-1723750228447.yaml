@@ -1,0 +1,259 @@
+Parameters:
+  DomainName:
+    Type: String
+    Default: transcribro.com
+  AppSubnet:
+    Type: AWS::EC2::Subnet::Id
+  LatestAMI:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2
+  CertbotEmail:
+    Type: String
+    Default: ryan.bell62101+transcribro@gmail.com
+  SshPublicKey:
+    Type: String
+  DockerImage:
+    Type: String
+    Default: ghcr.io/raian621/capstone-server:latest
+
+Resources:
+  PublicHostedZone:
+    DeletionPolicy: Retain
+    Type: AWS::Route53::HostedZone
+    Properties:
+      HostedZoneConfig:
+        Comment: Transcribro public hosted zone
+
+  Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub www.${DomainName}
+      WebsiteConfiguration:
+        IndexDocument: index.html
+
+  FrontendCertificate:
+    Type: AWS::CertificateManager::Certificate
+    Properties:
+      DomainName: !Sub www.${DomainName}
+      ValidationMethod: DNS
+
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Aliases:
+          - !Sub www.${DomainName}
+        DefaultCacheBehavior:
+          TargetOriginId: MyCDN
+          ViewerProtocolPolicy: redirect-to-https
+          ForwardedValues:
+            QueryString: true
+            Cookies:
+              Forward: none
+        DefaultRootObject: index.html
+        Enabled: true
+        Origins:
+          - DomainName: !GetAtt Bucket.RegionalDomainName
+            Id: MyCDN
+            S3OriginConfig:
+              OriginAccessIdentity: !Sub
+                - origin-access-identity/cloudfront/${OriginAccessIdentity}
+                - OriginAccessIdentity: !Ref DistributionOriginAccessIdentity
+        ViewerCertificate:
+          AcmCertificateArn: !Ref FrontendCertificate
+          MinimumProtocolVersion: TLSv1
+          SslSupportMethod: sni-only
+
+  DistributionOriginAccessIdentity:
+    Type: AWS::CloudFront::CloudFrontOriginAccessIdentity
+    Properties:
+      CloudFrontOriginAccessIdentityConfig:
+        Comment: MyCDN
+
+  DistributionBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref Bucket
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::cloudfront:user/CloudFront Origin Access Identity
+                ${DistributionOriginAccessIdentity}
+            Action: s3:GetObject
+            Resource: !Sub
+              - ${BucketArn}/*
+              - BucketArn: !GetAtt Bucket.Arn
+
+  FrontendRecordSetGroup:
+    Type: AWS::Route53::RecordSetGroup
+    Properties:
+      HostedZoneId: !Ref PublicHostedZone
+      RecordSets:
+        - Name: !Sub www.${DomainName}
+          Type: A
+          AliasTarget:
+            DNSName: !GetAtt Distribution.DomainName
+            HostedZoneId: Z2FDTNDATAQYW2
+
+  BackendInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref LatestAMI
+      SubnetId: !Ref AppSubnet
+      InstanceType: t2.micro
+      SecurityGroupIds:
+        - !GetAtt BackendSecurityGroup.GroupId
+      KeyName: !Ref BackendKeyPair
+      UserData: !Base64
+        Fn::Sub: |
+          #!/bin/bash -xe
+          yum update -y aws-cfn-bootstrap
+          /opt/aws/bin/cfn-init --stack ${AWS::StackName} --resource BackendInstance --configset Install --region ${AWS::Region} --verbose
+          /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource BackendInstance --region ${AWS::Region}
+    Metadata:
+      AWS::CloudFormation::Init:
+        configSets:
+          Install:
+            - installNginx
+            - installCertbot
+            - installDocker
+            - restartNginx
+        installNginx:
+          commands:
+            download:
+              command: amazon-linux-extras install nginx1 -y
+          services:
+            systemd:
+              nginx:
+                ensureRunning: true
+                enable: true
+          files:
+            /etc/nginx/nginx.conf:
+              content: !Sub |
+                user nginx;
+                worker_processes auto;
+                error_log /var/log/nginx/error.log;
+                pid /run/nginx.pid;
+
+                include /usr/share/nginx/modules/*.conf;
+
+                events {
+                  worker_connections 1024;
+                }
+
+                http {
+                  log_format  main  '$remote_addr - $remote_user [$time_local] "$request" '
+                    '$status $body_bytes_sent "$http_referer" '
+                    '"$http_user_agent" "$http_x_forwarded_for"';
+
+                  access_log /var/log/nginx/access.log main;
+                  
+                  sendfile            on;
+                  tcp_nopush          on;
+                  tcp_nodelay         on;
+                  keepalive_timeout   65;
+                  types_hash_max_size 4096;
+
+                  include /etc/nginx/mime.types;
+                  default_type application/octet-stream;
+
+                  include /etc/nginx/conf.d/*.conf;
+
+                  server {
+                    listen [::]:80;
+                    listen 80;
+                    server_name api.${DomainName} $http_host;
+                    rewrite ^ https://$host$request_uri? permanent;
+                  }
+                  server {
+                    listen [::]:443 ssl http2;
+                    listen      443 ssl http2;
+                    server_name           api.${DomainName} $http_host;
+                    ssl_protocols         TLSv1 TLSv1.1 TLSv1.2 TLSv1.3;
+                    ssl_certificate       /etc/letsencrypt/live/api.transcribro.com/fullchain.pem;
+                    ssl_certificate_key   /etc/letsencrypt/live/api.transcribro.com/privkey.pem;
+                    ssl_ecdh_curve secp521r1:secp384r1;
+                    ssl_ciphers EECDH+AESGCM:EECDH+AES256;
+                    ssl_session_cache shared:TLS:2m;
+                    ssl_buffer_size 4k;
+                    # OCSP stapling
+                    ssl_stapling on;
+                    ssl_stapling_verify on;
+                    resolver 1.1.1.1 1.0.0.1 [2606:4700:4700::1111] [2606:4700:4700::1001]; # Cloudflare
+                    # Set HSTS to 365 days
+                    add_header Strict-Transport-Security 'max-age=31536000; includeSubDomains; preload' always;
+                    # increase the max body size to 1 gigabyte
+                    client_max_body_size 1024M;
+                    location / {
+                      proxy_pass http://127.0.0.1:8000/;
+                    }
+                  }
+                }
+
+        installCertbot:
+          commands:
+            install:
+              command: !Sub |
+                amazon-linux-extras install epel -y
+                yum install certbot certbot-nginx -y
+                certbot certonly --nginx --non-interactive --agree-tos -m ${CertbotEmail} -d api.${DomainName}
+        installDocker:
+          packages:
+            yum:
+              docker: []
+          services:
+            systemd:
+              docker:
+                enabled: true
+                ensureRunning: true
+          commands:
+            addDockerGroup:
+              command: !Sub |
+                usermod -aG docker ec2-user
+                docker pull ${DockerImage}
+                docker container create -i -t --name transcribro-server \
+                  -p 8000:8000 \
+                  -e APP_CLIENT_URL=https://www.${DomainName} \
+                  -e MODE=PROD \
+                  -e OPENAI_API_KEY=... \
+                  ${DockerImage}
+                docker container start transcribro-server
+        restartNginx:
+          commands:
+            restart:
+              command: systemctl restart nginx
+
+  BackendSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Backend Security Group
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+
+  RecordSet:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      Name: !Sub api.${DomainName}
+      Type: A
+      HostedZoneId: !Ref PublicHostedZone
+      TTL: '900'
+      ResourceRecords:
+        - !GetAtt BackendInstance.PublicIp
+
+  BackendKeyPair:
+    Type: AWS::EC2::KeyPair
+    Properties:
+      KeyName: TranscribroBackendKeyPair
+      PublicKeyMaterial: !Ref SshPublicKey
